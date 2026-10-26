@@ -77,6 +77,21 @@
     cursor: progress;
 }
 
+.su-source {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 16px;
+    font-size: 13px;
+}
+
+.su-source select {
+    min-width: 0;
+    max-width: 100%;
+    min-height: 40px;
+}
+
 .su-spin {
     display: inline-flex;
 }

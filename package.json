@@ -1,0 +1,8 @@
+{
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "check": "node --check subscription-usage.ts && node --check subscription-usage/index.js",
+        "test": "node --test test/*.test.ts"
+    }
+}

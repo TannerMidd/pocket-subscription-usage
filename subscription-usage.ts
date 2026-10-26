@@ -2,14 +2,17 @@
  * Subscription usage: a page on the rail with how much of your Claude, ChatGPT (Codex), OpenCode Go, Grok, Z.ai, and
  * MiniMax plans is used, and when each limit resets, plus the DeepSeek balance when Pi has a DeepSeek key. The server
  * asks each service with the sign-ins already on this machine, so no key or token reaches the browser. The command
- * `/usage-plans` posts the same usage as a card in the session.
+ * `/usage-plans` posts the same usage as a card in the session. The optional Claude Bridge source reads Claude Code's
+ * local .credentials.json; it never runs a credential command or refreshes that login.
  */
 import { type ChildProcess, spawn } from "node:child_process";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 // A type import is gone when the module runs: only the type checker reads this path.
-import type { ExtensionWeb } from "/mnt/games/Development/pi-pocket/src/server/host.ts";
+import type { Web } from "./_pocket.d.ts";
 
 /** The version of Pi Pocket's extension API this module is written for. */
 export const pocketApi = 1;
@@ -468,11 +471,11 @@ function askCodex(signal: AbortSignal, children: Set<ChildProcess>): Promise<Rec
     });
 }
 
-export default function createSubscriptionUsage(_host: unknown, web: ExtensionWeb) {
+export default function createSubscriptionUsage(_host: unknown, web: Web) {
     // Pi's own models and sign-ins: `getAuth` renews an expiring subscription token under Pi's lock, as Pi does.
     let runtime: Promise<ModelRuntime> | undefined;
-    let last: { at: number; reports: Report[] } | undefined;
-    let pending: Promise<{ at: number; reports: Report[] }> | undefined;
+    const last = new Map<string, { at: number; reports: Report[] }>();
+    const pending = new Map<string, Promise<{ at: number; reports: Report[] }>>();
     // Turning the module off, or a new version of it, stops the reads still running, and Codex with them: the module
     // is gone once every Codex it started ended (one that ignores being asked to stop is killed after 2 s).
     const alive = new AbortController();
@@ -521,18 +524,75 @@ export default function createSubscriptionUsage(_host: unknown, web: ExtensionWe
         return found.key;
     };
 
-    async function claude(signal: AbortSignal): Promise<Report> {
-        const name = "Claude (Anthropic)";
+    async function bridgeCredential(signal: AbortSignal): Promise<string> {
+        // shortcut: Claude Code file credentials only; add OS keychain support if needed on macOS.
+        let oauth: { accessToken?: unknown; expiresAt?: unknown } | undefined;
 
         try {
-            const token = await credential("anthropic", signal);
+            const file = join(
+                process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"),
+                ".credentials.json",
+            );
+            oauth = JSON.parse(await readFile(file, { encoding: "utf8", signal })).claudeAiOauth;
+        } catch {
+            if (signal.aborted) {
+                throw signal.reason;
+            }
+
+            throw new Said(
+                "Claude Bridge needs a Claude Code subscription sign-in. Run claude auth login on the server.",
+            );
+        }
+
+        if (typeof oauth?.accessToken !== "string" || !oauth.accessToken.trim()) {
+            throw new Said(
+                "Claude Bridge has no Claude Code subscription token. Run claude auth login on the server.",
+            );
+        }
+
+        if (
+            oauth.expiresAt !== undefined &&
+            (typeof oauth.expiresAt !== "number" || !Number.isFinite(oauth.expiresAt))
+        ) {
+            throw new Said(
+                "Claude Code's sign-in has an invalid expiry. Run claude auth login on the server.",
+            );
+        }
+
+        if (typeof oauth.expiresAt === "number" && oauth.expiresAt <= Date.now()) {
+            throw new Said(
+                "Claude Bridge's Claude Code sign-in has expired. Refresh it in Claude Code or run claude auth login on the server.",
+            );
+        }
+
+        return oauth.accessToken;
+    }
+
+    async function claude(signal: AbortSignal, source: string): Promise<Report> {
+        const bridge = source === "bridge";
+        const id = bridge ? "claude-bridge" : "anthropic";
+        const name = bridge ? "Claude Bridge (Claude Code)" : "Claude (Anthropic)";
+
+        try {
+            const token = bridge
+                ? await bridgeCredential(signal)
+                : await credential("anthropic", signal);
             const response = await fetch("https://api.anthropic.com/api/oauth/usage", {
-                headers: { authorization: `Bearer ${token}`, "anthropic-beta": "oauth-2025-04-20" },
+                headers: {
+                    authorization: `Bearer ${token}`,
+                    "anthropic-beta": "oauth-2025-04-20",
+                },
                 redirect: "error",
                 signal,
             });
 
             if (!response.ok) {
+                if (bridge && (response.status === 401 || response.status === 403)) {
+                    throw new Said(
+                        `Claude Code refused the sign-in (${response.status}). Refresh it in Claude Code or run claude auth login on the server.`,
+                    );
+                }
+
                 throw answered(response.status);
             }
 
@@ -579,18 +639,21 @@ export default function createSubscriptionUsage(_host: unknown, web: ExtensionWe
             }
 
             return {
-                id: "anthropic",
+                id,
                 name,
                 ok: true,
                 limits,
                 notes: [
+                    ...(bridge
+                        ? ["Uses Claude Code's subscription sign-in for Claude Bridge."]
+                        : []),
                     data.extra_usage?.is_enabled === true
                         ? "Extra usage is on."
                         : "Extra usage is off.",
                 ],
             };
         } catch (error) {
-            return { id: "anthropic", name, ok: false, error: failed(error) };
+            return { id, name, ok: false, error: failed(error) };
         }
     }
 
@@ -1088,11 +1151,11 @@ export default function createSubscriptionUsage(_host: unknown, web: ExtensionWe
     }
 
     /** Every service at once, each on its own: one that fails leaves the others' answers. */
-    const read = async () => {
+    const read = async (source: string) => {
         const signal = AbortSignal.any([AbortSignal.timeout(TIMEOUT_MS), alive.signal]);
         const reports = (
             await Promise.all([
-                claude(signal),
+                claude(signal, source),
                 chatGpt(signal),
                 openCodeGo(signal),
                 grok(signal),
@@ -1105,35 +1168,54 @@ export default function createSubscriptionUsage(_host: unknown, web: ExtensionWe
             // The plans that answered first, each group in its own order: what failed goes to the end.
             .sort((a, b) => Number(b.ok) - Number(a.ok));
 
-        last = { at: Date.now(), reports };
+        const result = { at: Date.now(), reports };
+        last.set(source, result);
 
-        return last;
+        return result;
     };
 
-    /** The last answer while it is fresh, else a new read: one at a time, shared by the page and the command. */
-    const usage = (fresh: boolean) => {
-        const age = last === undefined ? Infinity : Date.now() - last.at;
+    /** The page and command share a read only when they use the same Claude sign-in. */
+    const usage = (fresh: boolean, source: string) => {
+        const cached = last.get(source);
+        const age = cached === undefined ? Infinity : Date.now() - cached.at;
 
-        if (last !== undefined && (age < MIN_GAP_MS || (!fresh && age < FRESH_MS))) {
-            return Promise.resolve(last);
+        if (cached !== undefined && (age < MIN_GAP_MS || (!fresh && age < FRESH_MS))) {
+            return Promise.resolve(cached);
         }
 
-        pending ??= read().finally(() => {
-            pending = undefined;
-        });
+        if (!pending.has(source)) {
+            pending.set(
+                source,
+                read(source).finally(() => {
+                    pending.delete(source);
+                }),
+            );
+        }
 
-        return pending;
+        return pending.get(source)!;
     };
 
     // GET /api/x/subscription-usage/usage, and ?fresh=1 to ask again now. The owner's alone (the default).
-    web.route("GET", "usage", ({ query }) => usage(query.get("fresh") === "1"));
+    web.route("GET", "usage", ({ query }) =>
+        usage(query.get("fresh") === "1", query.get("claude") === "bridge" ? "bridge" : "pi"),
+    );
 
     // /usage-plans: the same answer as a card in the session. The owner's alone, as the page is: it reads their
     // sign-ins. The card shows to everyone in the session, as each command's card does.
     web.command("usage-plans", {
         description: "Show how much of each plan is used, and when it resets",
+        args: "[pi|bridge]",
         scope: "global",
-        handler: async (_args, ctx) => {
+        handler: async (args, ctx) => {
+            const source = args.trim() || "pi";
+
+            if (source !== "pi" && source !== "bridge") {
+                throw web.error(400, "Use /usage-plans [pi|bridge].");
+            }
+
+            ctx.signal.throwIfAborted();
+
+            // The page can share this read; stopping a command stops its wait, not the shared request.
             const stopped = new Promise<never>((_, reject) => {
                 ctx.signal.addEventListener("abort", () => reject(ctx.signal.reason), {
                     once: true,
@@ -1142,7 +1224,10 @@ export default function createSubscriptionUsage(_host: unknown, web: ExtensionWe
 
             stopped.catch(() => {});
 
-            return { type: "card", output: usageCard(await Promise.race([usage(true), stopped])) };
+            return {
+                type: "card",
+                output: usageCard(await Promise.race([usage(true, source), stopped])),
+            };
         },
     });
     web.client("subscription-usage");

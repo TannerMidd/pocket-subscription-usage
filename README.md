@@ -15,7 +15,7 @@ You can also copy these files into the extensions folder of Pi Pocket (`~/.pi-po
 ## What it does
 
 - **On the server:** it adds one route, `GET usage`, for the owner only. The route asks each service for your usage:
-    - Claude and OpenCode Go: with the sign-ins that Pi already has on this computer.
+    - Claude and OpenCode Go: with the sign-ins that Pi already has on this computer. The Claude sign-in selector also offers **Claude Bridge (Claude Code)**. That option reads `claudeAiOauth.accessToken` from `$CLAUDE_CONFIG_DIR/.credentials.json`, or `~/.claude/.credentials.json` by default, and sends it only to the fixed Anthropic usage endpoint. It does not use Pi's `claude-bridge` placeholder auth entry, run login or credential commands, refresh a token, or fall back to another sign-in. Known-expired or malformed credentials show an error. File credentials are supported; OS keychains are not.
     - ChatGPT (Codex): it starts the Codex CLI (`codex app-server`), which uses its own sign-in. The Codex CLI must be installed and signed in (`codex login`).
     - Grok: with Pi's xAI sign-in for SuperGrok or X Premium (Menu → Providers). It reads the shared weekly pool, as the Grok CLI does. An xAI API key has no plan, so the page leaves Grok out.
     - Z.ai: with Pi's Z.ai key, for a GLM Coding Plan. It reads the 5-hour (and, on bigger plans, weekly) token windows and the monthly count of web search, web reader, and Zread calls. Without a Z.ai key, the page leaves Z.ai out.
@@ -38,8 +38,23 @@ OpenCode Go ──────────────────────�
 
 In the margin, `▸` marks the limit in force, `!` a warning, and `!!` a critical level. A Pi Pocket command needs a `-` in its name, so it is `/usage-plans`, not `/usage`; typing `/usage` suggests it.
 
+Use `/usage-plans bridge` for Claude Code's sign-in, or `/usage-plans pi` for Pi's Anthropic sign-in. With no argument, the command keeps the original Pi sign-in behavior; it does not read the browser's selection. The page and command keep separate cached results for each sign-in. The browser remembers its selection on that device. Stopping a command stops its wait; a shared read can continue for the page until its existing timeout or module disposal.
+
 It runs no tools and changes nothing in your sessions, other than the cards that you post.
+
+## Offline checks
+
+With Node 24 and a Pi Pocket checkout, link its existing dependencies and public types:
+
+```sh
+ln -s /path/to/pi-pocket/node_modules node_modules
+ln -s /path/to/pi-pocket/types/pocket.d.ts _pocket.d.ts
+npm run check
+npm test
+```
+
+The tests use fake sign-ins and mocked requests. They do not read real credentials, run a login command, or contact providers.
 
 ## License
 
-MIT
+MIT. Original extension by Tanner Middleton; Claude Code sign-in support contributed by Pierre Marrec.

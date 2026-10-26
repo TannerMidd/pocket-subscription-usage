@@ -12,6 +12,15 @@ const ALERT = "M12 3a9 9 0 1 0 0 18a9 9 0 1 0 0-18M12 7.5v5.5M12 16.5v.01";
 /** How often the page reads again while it shows, and the rail's badge in the background. */
 const PAGE_EVERY_MS = 60_000;
 const BADGE_EVERY_MS = 5 * 60_000;
+const CLAUDE_SOURCE_KEY = "pocket.subscription-usage.claude-source";
+
+function savedClaudeSource() {
+    try {
+        return localStorage.getItem(CLAUDE_SOURCE_KEY) === "bridge" ? "bridge" : "pi";
+    } catch {
+        return "pi";
+    }
+}
 /** A reset further away than this shows its date, not only its weekday. */
 const NEAR_MS = 6 * 86_400_000;
 /** The words for a level that needs a look, shown in the limit's line of details. An "ok" level has none. */
@@ -118,7 +127,7 @@ function glance(data) {
 }
 
 export default function setup(pocket) {
-    const { html, useEffect, useState, Icon, Loader, Spinner } = pocket;
+    const { html, useEffect, useState, useRef, Icon, Loader, Spinner } = pocket;
 
     pocket.style("look.css");
 
@@ -212,9 +221,8 @@ export default function setup(pocket) {
                     report.ok
                         ? report.limits.length > 0
                             ? html`<span class="su-count">
-                                  ${report.limits.length} limit${report.limits.length === 1
-                                      ? ""
-                                      : "s"}
+                                  ${report.limits.length}
+                                  limit${report.limits.length === 1 ? "" : "s"}
                               </span>`
                             : report.balance
                               ? html`<span class="su-count">Balance</span>`
@@ -224,9 +232,7 @@ export default function setup(pocket) {
             </header>
             ${
                 report.ok
-                    ? html`${
-                          report.balance && html`<${BalanceRow} balance=${report.balance} />`
-                      }
+                    ? html`${report.balance && html`<${BalanceRow} balance=${report.balance} />`}
                       ${
                           report.limits.length > 0
                               ? html`<ul class="su-limits" role="list">
@@ -255,46 +261,82 @@ export default function setup(pocket) {
 
     /** The page: loading, then one list of plans, or what went wrong, with Refresh. Reads again every minute. */
     function Usage() {
+        const [source, setSource] = useState(savedClaudeSource);
+        const revision = useRef(0);
         const [data, setData] = useState(null);
         const [error, setError] = useState(null);
         const [busy, setBusy] = useState(false);
 
         const load = async (fresh, signal) => {
+            const version = ++revision.current;
             setBusy(true);
 
             try {
-                const next = await pocket.api(`usage${fresh ? "?fresh=1" : ""}`, undefined, {
-                    signal,
-                });
+                const next = await pocket.api(
+                    `usage?claude=${source}${fresh ? "&fresh=1" : ""}`,
+                    undefined,
+                    {
+                        signal,
+                    },
+                );
+
+                if (signal?.aborted || version !== revision.current) {
+                    return;
+                }
 
                 setData(next);
                 setError(null);
                 badge(next);
             } catch (failure) {
-                if (!signal?.aborted) {
+                if (!signal?.aborted && version === revision.current) {
                     setError(failure.message);
                 }
             } finally {
-                if (!signal?.aborted) {
+                if (!signal?.aborted && version === revision.current) {
                     setBusy(false);
                 }
             }
         };
 
         useEffect(() => {
+            setData(null);
+            setError(null);
             const stop = new AbortController();
 
             void load(false, stop.signal);
             const timer = setInterval(() => void load(false, stop.signal), PAGE_EVERY_MS);
 
             return () => {
+                revision.current++;
                 stop.abort();
                 clearInterval(timer);
             };
-        }, []);
+        }, [source]);
+
+        const chooseSource = (event) => {
+            const next = event.currentTarget.value;
+            revision.current++;
+
+            try {
+                localStorage.setItem(CLAUDE_SOURCE_KEY, next);
+            } catch {
+                // The selection still works when browser storage is unavailable.
+            }
+
+            setSource(next);
+        };
+
+        const sourceControl = html`<label class="su-source">
+            <span>Claude sign-in</span>
+            <select value=${source} onChange=${chooseSource}>
+                <option value="pi">Pi (Anthropic)</option>
+                <option value="bridge">Claude Bridge (Claude Code)</option>
+            </select>
+        </label>`;
 
         if (!data && error) {
             return html`<div class="su">
+                ${sourceControl}
                 <div class="su-state" role="alert">
                     <${Icon} path=${ALERT} size=${16} />
                     <div class="su-state-text">
@@ -316,17 +358,22 @@ export default function setup(pocket) {
 
         if (!data) {
             return html`<div class="su" aria-busy="true">
+                ${sourceControl}
                 <${Loader} label="Asking your plans" />
             </div>`;
         }
 
         const read = new Date(data.at);
-        const stamp = read.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+        const stamp = read.toLocaleTimeString(undefined, {
+            hour: "numeric",
+            minute: "2-digit",
+        });
         const iso = Number.isFinite(read.getTime()) ? read.toISOString() : undefined;
         const { top, next } = glance(data);
         const wallet = (data.reports ?? []).find((report) => report.ok && report.balance);
 
         return html`<div class="su" aria-busy=${busy ? "true" : undefined}>
+            ${sourceControl}
             <div class="su-fetch">
                 <pre class="su-glyph" aria-hidden="true">${GLYPH}</pre>
                 <div class="su-info">
@@ -433,6 +480,7 @@ export default function setup(pocket) {
         keywords: [
             "anthropic",
             "claude",
+            "claude-bridge",
             "openai",
             "chatgpt",
             "codex",
@@ -453,17 +501,22 @@ export default function setup(pocket) {
     });
 
     // A reading in the background for the badge, while this tab is open; the server keeps answers a minute.
-    const check = () =>
-        pocket.api("usage").then(
+    const check = () => {
+        const source = savedClaudeSource();
+
+        return pocket.api(`usage?claude=${source}`).then(
             (data) => {
                 try {
-                    badge(data);
+                    if (source === savedClaudeSource()) {
+                        badge(data);
+                    }
                 } catch {
                     // A badge that cannot be drawn waits for the next reading.
                 }
             },
             () => {},
         );
+    };
     const timer = setInterval(check, BADGE_EVERY_MS);
 
     void check();
